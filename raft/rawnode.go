@@ -27,6 +27,9 @@ var ErrStepLocalMsg = errors.New("raft: cannot step raft local message")
 // but there is no peer found in raft.Prs for that node.
 var ErrStepPeerNotFound = errors.New("raft: cannot step as peer not found")
 
+// ErrInvalidConfig is returned when newRaft returns nil
+var ErrInvalidConfig = errors.New("raft: newRaft failed")
+
 // SoftState provides state that is volatile and does not need to be persisted to the WAL.
 type SoftState struct {
 	Lead      uint64
@@ -74,8 +77,13 @@ type RawNode struct {
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
-	// Your Code Here (2A).
-	return nil, nil
+	node := &RawNode{
+		Raft: newRaft(config),
+	}
+	if node.Raft == nil {
+		return nil, ErrInvalidConfig
+	}
+	return node, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -142,20 +150,33 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	// Your Code Here (2A).
-	return Ready{}
+	snapshot, _ := rn.Raft.RaftLog.storage.Snapshot()
+	r := Ready{
+		SoftState: &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
+		HardState: pb.HardState{
+			Term:   rn.Raft.Term,
+			Vote:   rn.Raft.Vote,
+			Commit: rn.Raft.RaftLog.committed,
+		},
+		Entries:          rn.Raft.RaftLog.entries,
+		Messages:         rn.Raft.msgs,
+		CommittedEntries: nil, // TODO(chapche)
+		Snapshot:         snapshot,
+	}
+	return r
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	// Your Code Here (2A).
-	return false
+	return len(rn.Raft.msgs) > 0
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
-	// Your Code Here (2A).
+	for _, m := range rd.Messages {
+		rn.Step(m)
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this

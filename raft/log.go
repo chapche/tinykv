@@ -14,13 +14,17 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"errors"
+
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
-//  snapshot/first.....applied....committed....stabled.....last
-//  --------|------------------------------------------------|
-//                            log entries
+//	snapshot/first.....applied....committed....stabled.....last
+//	--------|------------------------------------------------|
+//	                          log entries
 //
 // for simplify the RaftLog implement should manage all log entries
 // that not truncated
@@ -55,8 +59,14 @@ type RaftLog struct {
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-	// Your Code Here (2A).
-	return nil
+	log := &RaftLog{
+		storage:   storage,
+		committed: 0,
+		applied:   0,
+		stabled:   0,
+		entries:   make([]pb.Entry, 1),
+	}
+	return log
 }
 
 // We need to compact the log entries in some point of time like
@@ -70,30 +80,48 @@ func (l *RaftLog) maybeCompact() {
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	// Your Code Here (2A).
-	return nil
+	if l.stabled >= uint64(len(l.entries)) {
+		return nil
+	}
+	return l.entries[l.stabled+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	// Your Code Here (2A).
-	return nil
+	if l.applied >= uint64(len(l.entries)) {
+		return nil
+	}
+	return l.entries[l.applied+1 : l.committed]
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	// Your Code Here (2A).
-	return 0
+	notCompacted := uint64(len(l.entries))
+	if notCompacted > 0 {
+		notCompacted -= 1
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + notCompacted
+	}
+	return notCompacted
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// Your Code Here (2A).
-	return 0, nil
+	// TODO(chapche) checkout the entry in the snapshot or log entries.
+	if l.pendingSnapshot != nil {
+		if i <= l.pendingSnapshot.Metadata.Index { // TODO(chapche) what if compacted?
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		i -= l.pendingSnapshot.Metadata.Index
+	}
+	if num := len(l.entries); num > 0 && uint64(num) > i {
+		return l.entries[i].Term, nil
+	}
+	return 0, errors.New("RaftLog: entry index out of bound")
 }
