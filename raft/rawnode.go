@@ -71,8 +71,8 @@ type Ready struct {
 
 // RawNode is a wrapper of Raft.
 type RawNode struct {
-	Raft *Raft
-	// Your Data Here (2A).
+	Raft      *Raft
+	lastReady *Ready
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
@@ -82,6 +82,19 @@ func NewRawNode(config *Config) (*RawNode, error) {
 	}
 	if node.Raft == nil {
 		return nil, ErrInvalidConfig
+	}
+	snapshot, _ := node.Raft.RaftLog.storage.Snapshot()
+	node.lastReady = &Ready{
+		SoftState: &SoftState{Lead: node.Raft.Lead, RaftState: node.Raft.State},
+		HardState: pb.HardState{
+			Term:   node.Raft.Term,
+			Vote:   node.Raft.Vote,
+			Commit: node.Raft.RaftLog.committed,
+		},
+		Entries:          node.Raft.RaftLog.entries,
+		Messages:         node.Raft.msgs,
+		CommittedEntries: node.Raft.RaftLog.nextEnts(),
+		Snapshot:         snapshot,
 	}
 	return node, nil
 }
@@ -150,33 +163,65 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
-	snapshot, _ := rn.Raft.RaftLog.storage.Snapshot()
 	r := Ready{
-		SoftState: &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State},
-		HardState: pb.HardState{
+		Entries:          rn.Raft.RaftLog.unstableEntries(),
+		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+	}
+	if rn.lastReady.Lead != rn.Raft.Lead || rn.lastReady.RaftState != rn.Raft.State {
+		r.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+		rn.lastReady.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
+	}
+	if rn.lastReady.Term != rn.Raft.Term || rn.lastReady.Vote != rn.Raft.Vote ||
+		rn.lastReady.Commit != rn.Raft.RaftLog.committed {
+		r.HardState = pb.HardState{
 			Term:   rn.Raft.Term,
 			Vote:   rn.Raft.Vote,
 			Commit: rn.Raft.RaftLog.committed,
-		},
-		Entries:          rn.Raft.RaftLog.entries,
-		Messages:         rn.Raft.msgs,
-		CommittedEntries: nil, // TODO(chapche)
-		Snapshot:         snapshot,
+		}
+		rn.lastReady.HardState = pb.HardState{
+			Term:   rn.Raft.Term,
+			Vote:   rn.Raft.Vote,
+			Commit: rn.Raft.RaftLog.committed,
+		}
 	}
 	return r
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
-	return len(rn.Raft.msgs) > 0
+	if rn.lastReady.Lead != rn.Raft.Lead || rn.lastReady.RaftState != rn.Raft.State {
+		return true
+	}
+	if rn.lastReady.Term != rn.Raft.Term || rn.lastReady.Vote != rn.Raft.Vote ||
+		rn.lastReady.Commit != rn.Raft.RaftLog.committed {
+		return true
+	}
+	// check msg to be sent
+	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
+	// check entries to be stabled or applied
+	if len(rn.Raft.RaftLog.entries) > 0 {
+		index := rn.Raft.RaftLog.entries[len(rn.Raft.RaftLog.entries)-1].Index
+		if index > rn.Raft.RaftLog.stabled { // TODO(chapche) should be committed?
+			return true
+		}
+	}
+	// check entries to be applied
+	return rn.Raft.RaftLog.applied < rn.Raft.RaftLog.committed
 }
 
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
-	for _, m := range rd.Messages {
-		rn.Step(m)
+	// TODO(chapche) snapshot
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	// TODO(chapche) msgs
 }
 
 // GetProgress return the Progress of this node and its peers, if this

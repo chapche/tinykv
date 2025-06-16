@@ -307,7 +307,23 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	var newLastIndex uint64 = 0
+	var newLastTerm uint64 = 0
+	for _, entry := range entries {
+		if entry.Index > newLastIndex {
+			newLastIndex = entry.Index
+			newLastTerm = entry.Term
+		}
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+	}
+	// delete redundent entries
+	if newLastIndex < ps.raftState.LastIndex {
+		for i := newLastIndex + 1; i <= ps.raftState.LastIndex; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+		}
+	}
+	ps.raftState.LastIndex = newLastIndex
+	ps.raftState.LastTerm = newLastTerm
 	return nil
 }
 
@@ -330,8 +346,51 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
-	return nil, nil
+	// stable logs
+	raftWB := new(engine_util.WriteBatch)
+	if len(ready.Entries) > 0 {
+		err := ps.Append(ready.Entries, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if ready.HardState.Term > 0 {
+		ps.raftState.HardState = &ready.HardState
+		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	}
+	kvWB := new(engine_util.WriteBatch)
+	res, err := ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+	if err != nil {
+		return nil, err
+	}
+	// applyState and CommitEntries!
+	// for _, entry := range ready.CommittedEntries {
+	// 	switch entry.EntryType {
+	// 	case eraftpb.EntryType_EntryNormal:
+	// 		req := new(raft_cmdpb.Request)
+	// 		err := req.Unmarshal(entry.Data)
+	// 		if err != nil {
+	// 			return nil, err
+	// 		}
+	// 		switch req.CmdType {
+	// 		case raft_cmdpb.CmdType_Put:
+	// 			put := req.Put
+	// 			kvWB.SetMeta(put.Key)
+	// 		case raft_cmdpb.CmdType_Delete:
+	// 		}
+	// 	}
+	// }
+	// write to raftDb at once
+	err = raftWB.WriteToDB(ps.Engines.Raft)
+	if err != nil {
+		return nil, err
+	}
+	// TODO(chapche) what if raftWB succeeds and kvWB fails?
+	err = kvWB.WriteToDB(ps.Engines.Kv)
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -62,9 +62,32 @@ func newLog(storage Storage) *RaftLog {
 	log := &RaftLog{
 		storage:   storage,
 		committed: 0,
-		applied:   0,
+		applied:   0, // should be volitile, rebuild from log entries
 		stabled:   0,
-		entries:   make([]pb.Entry, 1),
+		entries:   make([]pb.Entry, 0),
+	}
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		return nil
+	}
+	log.committed = hardState.Commit
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		return nil
+	}
+	log.stabled = lastIndex
+	firstIndex, err := storage.FirstIndex()
+
+	if err == nil && firstIndex <= lastIndex {
+		entries, err2 := storage.Entries(firstIndex, lastIndex+1)
+		if err2 == nil {
+			for _, entry := range entries {
+				if entry.Term > 0 && entry.Index > 0 {
+					log.entries = append(log.entries, entry)
+				}
+			}
+		}
+
 	}
 	return log
 }
@@ -80,48 +103,60 @@ func (l *RaftLog) maybeCompact() {
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.
 func (l *RaftLog) allEntries() []pb.Entry {
-	return l.entries
+	res := make([]pb.Entry, 0, len(l.entries))
+	res = append(res, l.entries...)
+	return res
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-	if l.stabled >= uint64(len(l.entries)) {
-		return nil
+	// we don't evict stabled entry from memory since stabled >= committed >= applied
+	// it could be used by application even if it's stabled.
+	res := make([]pb.Entry, 0, len(l.entries))
+	for _, entry := range l.entries {
+		if entry.Index > l.stabled {
+			res = append(res, entry)
+		}
 	}
-	return l.entries[l.stabled+1:]
+	return res
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-	if l.applied >= uint64(len(l.entries)) {
-		return nil
+	// stabled >= committed >= applied
+	// get from storage
+	res := make([]pb.Entry, 0, l.committed-l.applied+1)
+	for _, entry := range l.entries {
+		if entry.Index > l.applied && entry.Index <= l.committed {
+			res = append(res, entry)
+		}
 	}
-	return l.entries[l.applied+1 : l.committed]
+	return res
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-	notCompacted := uint64(len(l.entries))
-	if notCompacted > 0 {
-		notCompacted -= 1
+	unstable := uint64(len(l.entries))
+	if unstable == 0 {
+		stable, err := l.storage.LastIndex()
+		if err != nil {
+			return 0
+		}
+		return stable
 	}
-	if l.pendingSnapshot != nil {
-		return l.pendingSnapshot.Metadata.Index + notCompacted
-	}
-	return notCompacted
+	return l.entries[unstable-1].Index
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	// TODO(chapche) checkout the entry in the snapshot or log entries.
-	if l.pendingSnapshot != nil {
-		if i <= l.pendingSnapshot.Metadata.Index { // TODO(chapche) what if compacted?
-			return l.pendingSnapshot.Metadata.Term, nil
-		}
-		i -= l.pendingSnapshot.Metadata.Index
+	stableTerm, err := l.storage.Term(i)
+	if err == nil {
+		return stableTerm, nil
 	}
-	if num := len(l.entries); num > 0 && uint64(num) > i {
-		return l.entries[i].Term, nil
+	for _, entry := range l.entries {
+		if entry.Index == i {
+			return entry.Term, nil
+		}
 	}
 	return 0, errors.New("RaftLog: entry index out of bound")
 }

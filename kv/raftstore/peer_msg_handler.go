@@ -10,6 +10,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -42,7 +43,57 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	rd := d.RaftGroup.Ready()
+	d.peerStorage.SaveReadyState(&rd)
+	for _, msg := range rd.Messages {
+		d.RaftGroup.Step(msg)
+	}
+	for _, entry := range rd.CommittedEntries {
+		msg := &raft_cmdpb.RaftCmdRequest{}
+		msg.Unmarshal(entry.Data)
+		cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
+		cmdResp.Header.CurrentTerm = entry.Term
+		// TODO(chapche) which engine should we use?
+		for _, req := range msg.Requests {
+			resp := &raft_cmdpb.Response{}
+			resp.CmdType = req.CmdType
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Get:
+				getResp := &raft_cmdpb.GetResponse{}
+				// TODO(chapche) value
+				resp.Get = getResp
+			case raft_cmdpb.CmdType_Put:
+				putResp := &raft_cmdpb.PutResponse{}
+				resp.Put = putResp
+			case raft_cmdpb.CmdType_Delete:
+				deleteResp := &raft_cmdpb.DeleteResponse{}
+				resp.Delete = deleteResp
+			case raft_cmdpb.CmdType_Snap:
+				snapResp := &raft_cmdpb.SnapResponse{}
+				snapResp.Region = d.Region()
+				resp.Snap = snapResp
+			}
+			cmdResp.Responses = append(cmdResp.Responses, resp)
+		}
+		if nil != msg.AdminRequest {
+			adminResp := &raft_cmdpb.AdminResponse{}
+			// TODO(chapche)
+			cmdResp.AdminResponse = adminResp
+		}
+
+		for i, proposal := range d.proposals {
+			if proposal.index == entry.Index && proposal.term == entry.Term {
+				proposal.cb.Done(cmdResp)
+				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				d.proposals = d.proposals[i+1:]
+				break
+			}
+		}
+	}
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -113,7 +164,30 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+	entries := make([]*eraftpb.Entry, 0, len(msg.Requests))
+	lastIndex := d.peerStorage.raftState.LastIndex
+	lastIndex++
+	b, _ := msg.Marshal()
+	entry := eraftpb.Entry{
+		EntryType: eraftpb.EntryType_EntryNormal,
+		Index:     lastIndex,
+		Term:      d.Term(),
+		Data:      b,
+	}
+	entries = append(entries, &entry)
+	pro := &proposal{
+		index: lastIndex,
+		term:  d.Term(),
+		cb:    cb,
+	}
+	d.proposals = append(d.proposals, pro)
+	raftMsg := eraftpb.Message{
+		MsgType: eraftpb.MessageType_MsgPropose,
+		From:    d.LeaderId(),
+		To:      d.LeaderId(),
+		Entries: entries,
+	}
+	d.RaftGroup.Step(raftMsg)
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +297,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
