@@ -171,27 +171,30 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
-	hardState, _, err := c.Storage.InitialState()
-	var term uint64
-	var vote uint64
-	term = 0
-	vote = None
-	if err == nil {
-		term = hardState.Term
-		vote = hardState.Vote
+	hardState, confState, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+	peers := c.peers
+	if len(c.peers) == 0 {
+		peers = confState.Nodes
+	}
+	prs := make(map[uint64]*Progress)
+	for _, id := range peers {
+		prs[id] = &Progress{}
 	}
 	return &Raft{
 		id:               c.ID,
-		Term:             term,
-		Vote:             vote,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
 		RaftLog:          newLog(c.Storage),
-		Prs:              make(map[uint64]*Progress),
+		Prs:              prs,
 		State:            StateFollower, // reduce unneccesary election
 		votes:            make(map[uint64]bool),
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
-		peers:            c.peers,
+		peers:            peers,
 	}
 }
 
@@ -343,7 +346,6 @@ func (r *Raft) becomeLeader() {
 	r.votes = make(map[uint64]bool)
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
-	r.Prs = make(map[uint64]*Progress)
 	lastIndex := r.RaftLog.LastIndex()
 	noOpEntry := &pb.Entry{
 		Term:  r.Term,
@@ -387,6 +389,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleRequestVote(m)
 		case pb.MessageType_MsgHup:
 			r.handleMsgHup(m)
+		case pb.MessageType_MsgRequestVoteResponse:
+			return nil
 		default:
 			log.Debugf("unexpected message type in follower state")
 			return errors.New("unexpected message type")
@@ -423,6 +427,9 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handlePropose(m)
 		case pb.MessageType_MsgHeartbeatResponse:
 			r.handleHeartbeatResponse(m)
+		// node will become a leader when received more than half votes, we need to handle remaining vote
+		case pb.MessageType_MsgRequestVoteResponse:
+			r.handleRequestVoteResponse(m)
 		default:
 			log.Debugf("unexpected message type in leader state")
 			return errors.New("unexpected message type")
@@ -484,6 +491,9 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 		r.onTermStale(m.Term, None)
 		return
 	}
+	if r.State == StateLeader {
+		return
+	}
 	r.votes[m.From] = !m.Reject
 	count := 0
 	for _, vote := range r.votes {
@@ -501,13 +511,38 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleAppendEntries handle AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	if m.Term < r.Term {
-		log.Debugf("term is stale, current term: %d, received term: %d", r.Term, m.Term)
+		log.Warnf("handleAppendEntries term is stale, current term: %v-%d, received term: %v-%d", r.id, r.Term, m.From, m.Term)
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			From:    r.id,
+			To:      m.From,
+			Term:    r.Term,
+			Index:   r.RaftLog.LastIndex(),
+			Reject:  true,
+			Commit: r.RaftLog.committed,
+		})
+		return	
 	} else {
+		// reset timer first
 		r.becomeFollower(m.Term, m.From)
+		if m.Commit < r.RaftLog.committed {
+			// in case there are stale msgs
+			log.Warnf("id from:%v to:%v stale committed index from:%v cur:%v", m.From, r.id, m.Commit, r.RaftLog.committed)
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgAppendResponse,
+				From:    r.id,
+				To:      m.From,
+				Term:    r.Term,
+				Index:   r.RaftLog.LastIndex(),
+				Reject:  true,
+				Commit: r.RaftLog.committed,
+			})
+			return
+		}
 		// check term and index
 		term, err := r.RaftLog.Term(m.Index)
 		if err != nil || term != m.LogTerm {
-			log.Debugf("log entry not match, current term: %d, received term: %d", term, m.LogTerm)
+			log.Warnf("log entry not match, index:%v current term: %v-%d, received term: %v-%d", m.Index, r.id, term, m.From, m.LogTerm)
 			index := m.Index
 			if index > 0 {
 				index--
@@ -519,6 +554,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				Term:    r.Term,
 				Index:   index,
 				Reject:  true,
+				Commit: r.RaftLog.committed,
 			})
 			return
 		}
@@ -564,10 +600,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry from message)!
 	var commitIndex uint64
-	commitIndex = m.Index
-	if len(m.Entries) > 0 {
-		commitIndex = m.Entries[len(m.Entries)-1].Index
-	}
+	commitIndex = r.RaftLog.LastIndex()
 	if m.Commit < commitIndex {
 		commitIndex = m.Commit
 	}
@@ -579,7 +612,62 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:      m.From,
 		Term:    r.Term,
 		Index:   r.RaftLog.LastIndex(),
+		Commit: r.RaftLog.committed,
+		Reject: false,
 	})
+}
+
+func (r *Raft) sendAppendEntries(to uint64, index uint64) {
+	logTerm, err := r.RaftLog.Term(index)
+	if err != nil {  // entry not found, negotiate from lastIndex
+		log.Warnf("sendAppendEntries entry not found! id:%v index:%v commit:%v logTerm:%v to:%v", to, index, r.RaftLog.committed, logTerm, to)
+		lastIndex := r.RaftLog.LastIndex()
+		logTerm, _ = r.RaftLog.Term(lastIndex)
+		msg := &pb.Message{
+			MsgType: pb.MessageType_MsgAppend,
+			From:    r.id,
+			To:      to,
+			Term:    r.Term,
+			Entries: nil,
+			Index:   r.RaftLog.LastIndex(),
+			LogTerm: logTerm,
+			Commit:  r.RaftLog.committed,
+		}
+		r.msgs = append(r.msgs, *msg)
+		return
+	}
+	idx := 0
+	entries := make([]*pb.Entry, 0, len(r.RaftLog.entries))
+	if index < r.RaftLog.stabled {
+		stabled_entries, _ := r.RaftLog.storage.Entries(index, r.RaftLog.stabled)
+		for _, entry := range stabled_entries {
+			entries = append(entries, &entry)
+		}
+	} else if index > 0 {
+		for i, entry := range r.RaftLog.entries {
+			if entry.Index == index {
+				logTerm = entry.Term
+				idx = i + 1
+				break
+			} else if entry.Index > index {
+				break
+			}
+		}
+	}
+	for ; idx < len(r.RaftLog.entries); idx++ {
+		entries = append(entries, &r.RaftLog.entries[idx])
+	}
+	msg := &pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Entries: entries,
+		Index:   index,
+		LogTerm: logTerm,
+		Commit:  r.RaftLog.committed,
+	}
+	r.msgs = append(r.msgs, *msg)
 }
 
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
@@ -591,31 +679,7 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		return
 	}
 	if m.Reject {
-		var logTerm uint64
-		idx := 0
-		if m.Index > 0 {
-			for i, entry := range r.RaftLog.entries {
-				if entry.Index == m.Index {
-					logTerm = entry.Term
-					idx = i + 1
-				}
-			}
-		}
-		entries := make([]*pb.Entry, 0, len(r.RaftLog.entries)-idx)
-		for ; idx < len(r.RaftLog.entries); idx++ {
-			entries = append(entries, &r.RaftLog.entries[idx])
-		}
-		msg := &pb.Message{
-			MsgType: pb.MessageType_MsgAppend,
-			From:    r.id,
-			To:      m.From,
-			Term:    r.Term,
-			Entries: entries,
-			Index:   m.Index,
-			LogTerm: logTerm,
-			Commit:  r.RaftLog.committed,
-		}
-		r.msgs = append(r.msgs, *msg)
+		r.sendAppendEntries(m.From, m.Index)
 		return
 	}
 	// update progress
@@ -655,22 +719,14 @@ func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
 		}
 		r.RaftLog.committed = matchIndexes[half]
 		// inform matched followers that commit changed!
-		for id, _ := range r.Prs {
+		for id, pr := range r.Prs {
 			if id == r.id {
 				continue
 			}
-			entry := &r.RaftLog.entries[len(r.RaftLog.entries)-1]
-			msg := &pb.Message{
-				MsgType: pb.MessageType_MsgAppend,
-				From:    r.id,
-				To:      id,
-				Term:    r.Term,
-				Entries: nil,
-				Index:   entry.Index,
-				LogTerm: entry.Term,
-				Commit:  r.RaftLog.committed,
+			if pr.Match+1 != pr.Next {
+				continue
 			}
-			r.msgs = append(r.msgs, *msg)
+			r.sendAppendEntries(id, pr.Match)
 		}
 		return
 	}
@@ -702,7 +758,7 @@ func (r *Raft) handleMsgHup(m pb.Message) {
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// check term and leader
 	if m.Term < r.Term {
-		log.Debugf("term is stale, current term: %d, received term: %d", r.Term, m.Term)
+		log.Warnf("handleHeartbeat term is stale, current term: %v-%d, received term: %v-%d", r.id, r.Term, m.From, m.Term)
 		return
 	}
 	r.becomeFollower(m.Term, m.From)
@@ -711,12 +767,8 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	// check if we have update-to-date log
 	var index uint64
 	var logTerm uint64
-	index, logTerm = 0, 0
-	if len(r.RaftLog.entries) > 0 {
-		entry := &r.RaftLog.entries[len(r.RaftLog.entries)-1]
-		index = entry.Index
-		logTerm = entry.Term
-	}
+	index = r.RaftLog.LastIndex()
+	logTerm, _ = r.RaftLog.Term(index)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		From:    r.id,
@@ -738,31 +790,18 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	}
 	pr := r.Prs[m.From]
 	term, err := r.RaftLog.Term(m.Index)
-	// we could commit safely if log match
+	// try update commit index and match info, then send entries if log match
 	if err == nil && term == m.LogTerm {
-		if m.Index <= pr.Match {
-			if m.Commit == r.RaftLog.committed {
-				return
-			}
-			if len(r.RaftLog.entries) == 0 {
-				return
-			}
-			entry := &r.RaftLog.entries[len(r.RaftLog.entries)-1]
-			msg := &pb.Message{
-				MsgType: pb.MessageType_MsgAppend,
-				From:    r.id,
-				To:      m.From,
-				Term:    r.Term,
-				Entries: nil,
-				Index:   entry.Index,
-				LogTerm: entry.Term,
-				Commit:  r.RaftLog.committed,
-			}
-			r.msgs = append(r.msgs, *msg)
+		if m.Index < pr.Match {
+			// append from index
+			log.Warnf("handleHeartbeatResponse id:%v unexpected match index: %v-%v from:%v", r.id, m.Index, pr.Match, m.From)
+			r.sendAppendEntries(m.From, m.Index)
 			return
 		}
-		pr.Match = m.Index
-		pr.Next = m.Index + 1
+		if m.Index >= pr.Next {
+			pr.Match = m.Index
+			pr.Next = m.Index + 1
+		}
 		matchIndexes := make([]uint64, 0, len(r.Prs))
 		for id, pr := range r.Prs {
 			if id == r.id {
@@ -799,47 +838,19 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 				if pr.Match+1 != pr.Next {
 					continue
 				}
-				entry := &r.RaftLog.entries[len(r.RaftLog.entries)-1]
-				msg := &pb.Message{
-					MsgType: pb.MessageType_MsgAppend,
-					From:    r.id,
-					To:      id,
-					Term:    r.Term,
-					Entries: nil,
-					Index:   entry.Index,
-					LogTerm: entry.Term,
-					Commit:  r.RaftLog.committed,
-				}
-				r.msgs = append(r.msgs, *msg)
+				// fill from matched in case unnessary negotiation
+				r.sendAppendEntries(id, pr.Match)
 			}
 			return
+		} else if (m.Commit < r.RaftLog.committed) {
+			// update commitIndex
+			log.Infof("handleHeartbeatResponse id:%v update committedIndex from %v to %v", r.id, m.Commit, r.RaftLog.committed)
+			r.sendAppendEntries(m.From, m.Index)
+			return
 		}
-	} else { // try append entries if not match
-		var logTerm uint64
-		idx := 0
-		if m.Index > 0 {
-			for i, entry := range r.RaftLog.entries {
-				if entry.Index == m.Index {
-					logTerm = entry.Term
-					idx = i + 1
-				}
-			}
-		}
-		entries := make([]*pb.Entry, 0, len(r.RaftLog.entries)-idx)
-		for ; idx < len(r.RaftLog.entries); idx++ {
-			entries = append(entries, &r.RaftLog.entries[idx])
-		}
-		msg := &pb.Message{
-			MsgType: pb.MessageType_MsgAppend,
-			From:    r.id,
-			To:      m.From,
-			Term:    r.Term,
-			Entries: entries,
-			Index:   m.Index,
-			LogTerm: logTerm,
-			Commit:  r.RaftLog.committed,
-		}
-		r.msgs = append(r.msgs, *msg)
+	} else { // only send entries if not match
+		log.Warnf("handleHeartbeatResponse index:%v log entry missmatch id:%v-%v from:%v-%v", m.Index, r.id, term, m.From, m.LogTerm)	
+		r.sendAppendEntries(m.From, m.Index)
 	}
 }
 

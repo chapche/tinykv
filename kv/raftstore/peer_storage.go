@@ -322,6 +322,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 		}
 	}
+	log.Infof("Tag:%v change index old:%v-%v new: %v-%v\n", ps.Tag, ps.raftState.LastIndex, ps.raftState.LastTerm, newLastIndex, newLastTerm)
 	ps.raftState.LastIndex = newLastIndex
 	ps.raftState.LastTerm = newLastTerm
 	return nil
@@ -329,7 +330,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 
 // Apply the peer with given snapshot
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
-	log.Infof("%v begin to apply snapshot", ps.Tag)
+	// log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
@@ -363,33 +364,10 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	if err != nil {
 		return nil, err
 	}
-	// applyState and CommitEntries!
-	// for _, entry := range ready.CommittedEntries {
-	// 	switch entry.EntryType {
-	// 	case eraftpb.EntryType_EntryNormal:
-	// 		req := new(raft_cmdpb.Request)
-	// 		err := req.Unmarshal(entry.Data)
-	// 		if err != nil {
-	// 			return nil, err
-	// 		}
-	// 		switch req.CmdType {
-	// 		case raft_cmdpb.CmdType_Put:
-	// 			put := req.Put
-	// 			kvWB.SetMeta(put.Key)
-	// 		case raft_cmdpb.CmdType_Delete:
-	// 		}
-	// 	}
-	// }
-	// write to raftDb at once
-	err = raftWB.WriteToDB(ps.Engines.Raft)
-	if err != nil {
-		return nil, err
-	}
-	// TODO(chapche) what if raftWB succeeds and kvWB fails?
-	err = kvWB.WriteToDB(ps.Engines.Kv)
-	if err != nil {
-		return nil, err
-	}
+	// write to raftDb at once which CANNOT fail!
+	raftWB.MustWriteToDB(ps.Engines.Raft)
+	// TODO(chapche) write applyState!
+	kvWB.MustWriteToDB(ps.Engines.Kv)
 	return res, nil
 }
 

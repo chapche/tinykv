@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -184,6 +185,11 @@ func (rn *RawNode) Ready() Ready {
 			Commit: rn.Raft.RaftLog.committed,
 		}
 	}
+	if len(rn.Raft.msgs) > 0 {
+		r.Messages = rn.Raft.msgs
+		// clear msgs
+		rn.Raft.msgs = []pb.Message{}
+	}
 	return r
 }
 
@@ -203,7 +209,7 @@ func (rn *RawNode) HasReady() bool {
 	// check entries to be stabled or applied
 	if len(rn.Raft.RaftLog.entries) > 0 {
 		index := rn.Raft.RaftLog.entries[len(rn.Raft.RaftLog.entries)-1].Index
-		if index > rn.Raft.RaftLog.stabled { // TODO(chapche) should be committed?
+		if index > rn.Raft.RaftLog.stabled {
 			return true
 		}
 	}
@@ -218,10 +224,13 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
-	if len(rd.CommittedEntries) > 0 {
-		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	if rn.Raft.RaftLog.committed < rd.Commit {
+		rn.Raft.RaftLog.committed = rd.Commit	
 	}
-	// TODO(chapche) msgs
+	if len(rd.CommittedEntries) > 0 {
+		lastAppliedIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		rn.Raft.RaftLog.applied = lastAppliedIndex 
+	}
 }
 
 // GetProgress return the Progress of this node and its peers, if this

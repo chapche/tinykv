@@ -9,6 +9,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
@@ -48,28 +49,41 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	rd := d.RaftGroup.Ready()
 	d.peerStorage.SaveReadyState(&rd)
-	for _, msg := range rd.Messages {
-		d.RaftGroup.Step(msg)
-	}
+	d.Send(d.ctx.trans, rd.Messages)
 	for _, entry := range rd.CommittedEntries {
 		msg := &raft_cmdpb.RaftCmdRequest{}
 		msg.Unmarshal(entry.Data)
 		cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
 		cmdResp.Header.CurrentTerm = entry.Term
-		// TODO(chapche) which engine should we use?
 		for _, req := range msg.Requests {
 			resp := &raft_cmdpb.Response{}
 			resp.CmdType = req.CmdType
 			switch req.CmdType {
 			case raft_cmdpb.CmdType_Get:
 				getResp := &raft_cmdpb.GetResponse{}
-				// TODO(chapche) value
+				txn := d.peerStorage.Engines.Kv.NewTransaction(false)
+				key := req.Get.Key
+				// TODO(chapche) what if not found? How can we propegate the error?
+				if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+					getResp.Value = nil
+				} else {
+					val, err := engine_util.GetCFFromTxn(txn, req.Get.Cf, key)
+					if err == nil {
+						getResp.Value = val
+					}
+				}
 				resp.Get = getResp
 			case raft_cmdpb.CmdType_Put:
 				putResp := &raft_cmdpb.PutResponse{}
+				kvWB := new(engine_util.WriteBatch)
+				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 				resp.Put = putResp
 			case raft_cmdpb.CmdType_Delete:
 				deleteResp := &raft_cmdpb.DeleteResponse{}
+				kvWB := new(engine_util.WriteBatch)
+				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
 				resp.Delete = deleteResp
 			case raft_cmdpb.CmdType_Snap:
 				snapResp := &raft_cmdpb.SnapResponse{}
@@ -86,8 +100,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 		for i, proposal := range d.proposals {
 			if proposal.index == entry.Index && proposal.term == entry.Term {
-				proposal.cb.Done(cmdResp)
+				log.Infof("Tag:%v proposal done index-term %v-%v\n", d.Tag, proposal.index, proposal.term)
 				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				proposal.cb.Done(cmdResp)
 				d.proposals = d.proposals[i+1:]
 				break
 			}
@@ -180,6 +195,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		term:  d.Term(),
 		cb:    cb,
 	}
+	log.Infof("Tag:%v Leader:%v append proposal index-term %v-%v", d.Tag, d.LeaderId(), lastIndex, d.Term())
 	d.proposals = append(d.proposals, pro)
 	raftMsg := eraftpb.Message{
 		MsgType: eraftpb.MessageType_MsgPropose,
