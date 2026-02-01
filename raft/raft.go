@@ -16,10 +16,8 @@ package raft
 
 import (
 	"errors"
-	"sort"
-
 	"math/rand"
-	"time"
+	"sort"
 
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -164,6 +162,10 @@ type Raft struct {
 	PendingConfIndex uint64
 	// IDs of all nodes (including self)
 	peers []uint64
+	// randomizedElectionTimeout is a random number between
+	// [electionTimeout, 2 * electionTimeout). It gets reset
+	// when raft changes its state to follower or candidate.
+	randomizedElectionTimeout int
 }
 
 // newRaft return a raft peer with the given config
@@ -183,7 +185,7 @@ func newRaft(c *Config) *Raft {
 	for _, id := range peers {
 		prs[id] = &Progress{}
 	}
-	return &Raft{
+	r := &Raft{
 		id:               c.ID,
 		Term:             hardState.Term,
 		Vote:             hardState.Vote,
@@ -196,6 +198,8 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 		peers:            peers,
 	}
+	r.resetRandomizedElectionTimeout()
+	return r
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
@@ -268,11 +272,7 @@ func (r *Raft) tick() {
 	switch r.State {
 	case StateFollower:
 		r.electionElapsed++
-		// add random time in case multiple nodes timeout at the same time
-		src := rand.NewSource(time.Now().UnixNano())
-		newRand := rand.New(src)
-		randomTime := newRand.Intn(2 * r.electionTimeout)
-		if r.electionElapsed >= r.electionTimeout+randomTime {
+		if r.electionElapsed >= r.randomizedElectionTimeout {
 			r.becomeCandidate()
 			if len(r.peers) <= 1 {
 				r.becomeLeader()
@@ -296,10 +296,8 @@ func (r *Raft) tick() {
 		}
 	case StateCandidate:
 		r.electionElapsed++
-		src := rand.NewSource(time.Now().UnixNano())
-		newRand := rand.New(src)
-		randomTime := newRand.Intn(2 * r.electionTimeout)
-		if r.electionElapsed >= r.electionTimeout+randomTime {
+		if r.electionElapsed >= r.randomizedElectionTimeout {
+			r.resetRandomizedElectionTimeout()
 			r.Term++ // start another election round
 			r.electionElapsed = 0
 			for _, id := range r.peers {
@@ -324,6 +322,7 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	// reset election timer and heartbeat timer
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
+	r.resetRandomizedElectionTimeout()
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -335,6 +334,7 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 	r.heartbeatElapsed = 0
 	r.electionElapsed = 0
+	r.resetRandomizedElectionTimeout()
 }
 
 // becomeLeader transform this peer's state to leader
@@ -912,6 +912,10 @@ func (r *Raft) onTermStale(term uint64, lead uint64) {
 
 func (r *Raft) resetElectionTimer() {
 	r.electionElapsed = 0
+}
+
+func (r *Raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 }
 
 // handleSnapshot handle Snapshot RPC request

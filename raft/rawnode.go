@@ -17,7 +17,6 @@ package raft
 import (
 	"errors"
 
-	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -167,6 +166,7 @@ func (rn *RawNode) Ready() Ready {
 	r := Ready{
 		Entries:          rn.Raft.RaftLog.unstableEntries(),
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
+		Messages:         rn.Raft.msgs,
 	}
 	if rn.lastReady.Lead != rn.Raft.Lead || rn.lastReady.RaftState != rn.Raft.State {
 		r.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
@@ -231,6 +231,8 @@ func (rn *RawNode) Advance(rd Ready) {
 		lastAppliedIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		rn.Raft.RaftLog.applied = lastAppliedIndex 
 	}
+	// Clear messages that have been sent
+	rn.Raft.msgs = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this
