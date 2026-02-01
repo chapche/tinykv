@@ -57,23 +57,17 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 	// Your Code Here (1).
 	err := s.db.Update(func(txn *badger.Txn) error {
 		for _, modify := range batch {
-			var entry *badger.Entry
+			key := engine_util.KeyWithCF(modify.Cf(), modify.Key())
+			var err error
 			switch modify.Data.(type) {
 			case storage.Put:
-				entry = &badger.Entry{
-					Key:   engine_util.KeyWithCF(modify.Cf(), modify.Key()),
-					Value: modify.Value(),
-				}
+				err = txn.Set(key, modify.Value())
 			case storage.Delete:
-				entry = &badger.Entry{
-					Key:   engine_util.KeyWithCF(modify.Cf(), modify.Key()),
-					Value: nil,
-				}
+				err = txn.Delete(key)
 			}
-			err1 := txn.SetEntry(entry)
-			if err1 != nil {
-				log.Error(err1)
-				return err1
+			if err != nil {
+				log.Error(err)
+				return err
 			}
 		}
 		return nil
@@ -92,16 +86,19 @@ type StandAloneStorageReader struct {
 func (r *StandAloneStorageReader) GetCF(cf string, key []byte) ([]byte, error) {
 	item, err := r.txn.Get(engine_util.KeyWithCF(cf, key))
 	if err != nil {
+		if err == badger.ErrKeyNotFound {
+			return nil, nil // key 不存在返回 nil，不是错误
+		}
 		log.Error(err)
 		return nil, err
 	}
 	if item.IsDeleted() || item.ValueSize() == 0 {
 		return nil, nil
 	}
-	value, err2 := item.Value()
-	if err2 != nil {
-		log.Error(err2)
-		return nil, err2
+	value, err := item.Value()
+	if err != nil {
+		log.Error(err)
+		return nil, err
 	}
 	return value, nil
 }

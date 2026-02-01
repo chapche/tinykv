@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 
-	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/storage"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
 )
@@ -20,11 +19,8 @@ func (server *Server) RawGet(_ context.Context, req *kvrpcpb.RawGetRequest) (*kv
 	}
 	defer reader.Close()
 	val, err := reader.GetCF(req.Cf, req.Key)
-	if err != nil && err != badger.ErrKeyNotFound {
+	if err != nil {
 		return nil, err
-	}
-	if val != nil && len(val) == 0 {
-		val = nil
 	}
 	res := &kvrpcpb.RawGetResponse{
 		Value:    val,
@@ -89,13 +85,17 @@ func (server *Server) RawScan(_ context.Context, req *kvrpcpb.RawScanRequest) (*
 	defer iter.Close()
 
 	for iter.Seek(req.StartKey); iter.Valid(); iter.Next() {
-		kv := iter.Item()
-		if kv.ValueSize() == 0 {
+		item := iter.Item()
+		if item.ValueSize() == 0 {
 			continue
 		}
-		val, _ := kv.Value()
+		val, err := item.Value()
+		if err != nil {
+			res.Error = err.Error()
+			return res, err
+		}
 		res.Kvs = append(res.Kvs, &kvrpcpb.KvPair{
-			Key:   kv.Key(),
+			Key:   item.Key(),
 			Value: val,
 		})
 		if len(res.Kvs) >= int(req.Limit) {
