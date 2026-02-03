@@ -16,6 +16,7 @@ import (
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 type PeerTick int
@@ -49,9 +50,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	rd := d.RaftGroup.Ready()
 	d.peerStorage.SaveReadyState(&rd)
 	d.Send(d.ctx.trans, rd.Messages)
-	for _, entry := range rd.CommittedEntries {
+	d.processCommittedEntries(rd.CommittedEntries)
+	d.RaftGroup.Advance(rd)
+}
+
+func (d *peerMsgHandler) processCommittedEntries(entries []pb.Entry) {
+	for _, entry := range entries {
+		// Skip noop entries (empty data)
+		if len(entry.Data) == 0 {
+			continue
+		}
 		msg := &raft_cmdpb.RaftCmdRequest{}
-		msg.Unmarshal(entry.Data)
+		if err := msg.Unmarshal(entry.Data); err != nil {
+			log.Warnf("Tag:%v failed to unmarshal entry data: %v", d.Tag, err)
+			continue
+		}
 		cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
 		cmdResp.Header.CurrentTerm = entry.Term
 		for _, req := range msg.Requests {
@@ -71,6 +84,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 						getResp.Value = val
 					}
 				}
+				txn.Discard()
 				resp.Get = getResp
 			case raft_cmdpb.CmdType_Put:
 				putResp := &raft_cmdpb.PutResponse{}
@@ -97,17 +111,35 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			cmdResp.AdminResponse = adminResp
 		}
 
-		for i, proposal := range d.proposals {
-			if proposal.index == entry.Index && proposal.term == entry.Term {
-				log.Infof("Tag:%v proposal done index-term %v-%v\n", d.Tag, proposal.index, proposal.term)
-				proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
-				proposal.cb.Done(cmdResp)
-				d.proposals = d.proposals[i+1:]
+		// Find and remove matching proposal, also clean up stale proposals
+		for i := 0; i < len(d.proposals); {
+			proposal := d.proposals[i]
+			if proposal.index <= entry.Index {
+				d.proposals = append(d.proposals[:i], d.proposals[i+1:]...)
+			}
+			if proposal.cb == nil {
+				continue
+			}
+			if proposal.index < entry.Index {
+				// Stale proposal (index already passed), remove it
+				// This can happen if leader changed and the proposal was not committed
+				proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+				continue
+			}
+			if proposal.index == entry.Index {
+				if proposal.term == entry.Term {
+					// Matched, complete the proposal
+					proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+					proposal.cb.Done(cmdResp)
+				} else {
+					// Same index but different term, proposal was overwritten by new leader
+					proposal.cb.Done(ErrRespStaleCommand(proposal.term))
+				}
 				break
 			}
+			i++
 		}
 	}
-	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -175,7 +207,9 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		return
 	}
 	b, _ := msg.Marshal()
@@ -186,13 +220,14 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		term:  d.Term(),
 		cb:    cb,
 	}
-	log.Infof("Tag:%v Leader:%v append proposal index-term %v-%v", d.Tag, d.LeaderId(), lastIndex, d.Term())
 	d.proposals = append(d.proposals, pro)
 	// Let Raft layer handle the entry index and term assignment
 	err = d.RaftGroup.Propose(b)
 	if err != nil {
 		log.Warnf("Tag:%v propose failed: %v", d.Tag, err)
-		cb.Done(ErrResp(err))
+		if cb != nil {
+			cb.Done(ErrResp(err))
+		}
 		// Remove the proposal we just added
 		d.proposals = d.proposals[:len(d.proposals)-1]
 	}

@@ -325,7 +325,6 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
 		}
 	}
-	log.Infof("Tag:%v change index old:%v-%v new: %v-%v\n", ps.Tag, ps.raftState.LastIndex, ps.raftState.LastTerm, newLastIndex, newLastTerm)
 	ps.raftState.LastIndex = newLastIndex
 	ps.raftState.LastTerm = newLastTerm
 	return nil

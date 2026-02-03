@@ -854,7 +854,6 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 			return
 		} else if m.Commit < r.RaftLog.committed {
 			// update commitIndex
-			log.Infof("handleHeartbeatResponse id:%v update committedIndex from %v to %v", r.id, m.Commit, r.RaftLog.committed)
 			r.sendAppendEntries(m.From, m.Index)
 			return
 		}
@@ -879,9 +878,6 @@ func (r *Raft) handleBeat(m pb.Message) {
 
 func (r *Raft) handlePropose(m pb.Message) {
 	index := r.RaftLog.LastIndex()
-	oldIndex := index
-	// Get the term of the previous entry for log matching
-	oldLogTerm, _ := r.RaftLog.Term(oldIndex)
 	for _, entry := range m.Entries {
 		index++
 		entry.Index = index
@@ -889,28 +885,18 @@ func (r *Raft) handlePropose(m pb.Message) {
 		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
 	}
 	// we can commit directly if there are no peers
+	r.Prs[r.id].Match = index
+	r.Prs[r.id].Next = index + 1
 	if len(r.Prs) <= 1 {
 		r.RaftLog.committed = index
 		return
 	}
-	r.Prs[r.id].Match = index
-	r.Prs[r.id].Next = index + 1
 	// send msg
-	for id := range r.Prs {
+	for id, pr := range r.Prs {
 		if id == r.id {
 			continue
 		}
-		msg := &pb.Message{
-			MsgType: pb.MessageType_MsgAppend,
-			From:    r.id,
-			To:      id,
-			Term:    r.Term,
-			Entries: m.Entries,
-			Index:   oldIndex,
-			LogTerm: oldLogTerm, // Use the correct term of the previous entry
-			Commit:  r.RaftLog.committed,
-		}
-		r.msgs = append(r.msgs, *msg)
+		r.sendAppendEntries(id, pr.Match)
 	}
 }
 
