@@ -6,17 +6,18 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
 	"github.com/pingcap/errors"
-	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 type PeerTick int
@@ -48,10 +49,144 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	rd := d.RaftGroup.Ready()
-	d.peerStorage.SaveReadyState(&rd)
+	result, err := d.peerStorage.SaveReadyState(&rd)
+	if err != nil {
+		log.Errorf("Tag:%v failed to save ready state: %v", d.Tag, err)
+		return
+	}
+
+	// Handle snapshot apply result
+	if result != nil {
+		// Update storeMeta with new region info
+		d.ctx.storeMeta.Lock()
+		d.ctx.storeMeta.regions[result.Region.Id] = result.Region
+		d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: result.Region})
+		d.ctx.storeMeta.Unlock()
+	}
+
 	d.Send(d.ctx.trans, rd.Messages)
-	d.processCommittedEntries(rd.CommittedEntries)
+
+	// Don't process committed entries if we just applied a snapshot
+	// because the snapshot already contains the applied state
+	if result == nil {
+		d.processCommittedEntries(rd.CommittedEntries)
+	}
+
 	d.RaftGroup.Advance(rd)
+}
+
+func (d *peerMsgHandler) processNormalRequest(msg *raft_cmdpb.RaftCmdRequest) *raft_cmdpb.RaftCmdResponse {
+	cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{
+		CurrentTerm: d.Term(),
+	}}
+	for _, req := range msg.Requests {
+		resp := &raft_cmdpb.Response{}
+		resp.CmdType = req.CmdType
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			getResp := &raft_cmdpb.GetResponse{}
+			txn := d.peerStorage.Engines.Kv.NewTransaction(false)
+			key := req.Get.Key
+			// TODO(chapche) what if not found? Do we need to propegate the error?
+			if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
+				getResp.Value = nil
+			} else {
+				val, err := engine_util.GetCFFromTxn(txn, req.Get.Cf, key)
+				if err == nil {
+					getResp.Value = val
+				}
+			}
+			txn.Discard()
+			resp.Get = getResp
+		case raft_cmdpb.CmdType_Put:
+			putResp := &raft_cmdpb.PutResponse{}
+			kvWB := new(engine_util.WriteBatch)
+			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+			resp.Put = putResp
+		case raft_cmdpb.CmdType_Delete:
+			deleteResp := &raft_cmdpb.DeleteResponse{}
+			kvWB := new(engine_util.WriteBatch)
+			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+			kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+			resp.Delete = deleteResp
+		case raft_cmdpb.CmdType_Snap:
+			snapResp := &raft_cmdpb.SnapResponse{
+				Region: d.Region(),
+			}
+			resp.Snap = snapResp
+		}
+		cmdResp.Responses = append(cmdResp.Responses, resp)
+	}
+	return cmdResp
+}
+
+// TODO(chapche): implement these requests
+func (d *peerMsgHandler) processChangePeerRequest(req *raft_cmdpb.ChangePeerRequest) *raft_cmdpb.ChangePeerResponse {
+	return &raft_cmdpb.ChangePeerResponse{Region: d.Region()}
+}
+
+func (d *peerMsgHandler) processCompactLogRequest(req *raft_cmdpb.CompactLogRequest) *raft_cmdpb.CompactLogResponse {
+	compactIndex := req.CompactIndex
+	compactTerm := req.CompactTerm
+
+	// Check if the compact request is stale
+	if compactIndex <= d.peerStorage.applyState.TruncatedState.Index {
+		return &raft_cmdpb.CompactLogResponse{}
+	}
+
+	// Update TruncatedState
+	d.peerStorage.applyState.TruncatedState.Index = compactIndex
+	d.peerStorage.applyState.TruncatedState.Term = compactTerm
+
+	// Persist the updated ApplyState to kvDB
+	kvWB := new(engine_util.WriteBatch)
+	kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+	kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
+
+	// Schedule the actual log compaction task to raftlog-gc worker
+	d.ScheduleCompactLog(compactIndex)
+
+	return &raft_cmdpb.CompactLogResponse{}
+}
+
+// TODO(chapche): implement this request
+func (d *peerMsgHandler) processTransferLeaderRequest(req *raft_cmdpb.TransferLeaderRequest) *raft_cmdpb.TransferLeaderResponse {
+	return &raft_cmdpb.TransferLeaderResponse{}
+}
+
+// TODO(chapche): implement this request
+func (d *peerMsgHandler) processSplitRequest(req *raft_cmdpb.SplitRequest) *raft_cmdpb.SplitResponse {
+	return &raft_cmdpb.SplitResponse{}
+}
+
+func (d *peerMsgHandler) processAdminRequest(msg *raft_cmdpb.RaftCmdRequest) *raft_cmdpb.RaftCmdResponse {
+	cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{
+		CurrentTerm: d.Term(),
+	}}
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		cmdResp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    msg.AdminRequest.CmdType,
+			ChangePeer: d.processChangePeerRequest(msg.AdminRequest.ChangePeer),
+		}
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		cmdResp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:    msg.AdminRequest.CmdType,
+			CompactLog: d.processCompactLogRequest(msg.AdminRequest.CompactLog),
+		}
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		cmdResp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType:        msg.AdminRequest.CmdType,
+			TransferLeader: d.processTransferLeaderRequest(msg.AdminRequest.TransferLeader),
+		}
+	case raft_cmdpb.AdminCmdType_Split:
+		cmdResp.AdminResponse = &raft_cmdpb.AdminResponse{
+			CmdType: msg.AdminRequest.CmdType,
+			Split:   d.processSplitRequest(msg.AdminRequest.Split),
+		}
+	}
+	return cmdResp
 }
 
 func (d *peerMsgHandler) processCommittedEntries(entries []pb.Entry) {
@@ -65,50 +200,12 @@ func (d *peerMsgHandler) processCommittedEntries(entries []pb.Entry) {
 			log.Warnf("Tag:%v failed to unmarshal entry data: %v", d.Tag, err)
 			continue
 		}
-		cmdResp := &raft_cmdpb.RaftCmdResponse{Header: &raft_cmdpb.RaftResponseHeader{}}
-		cmdResp.Header.CurrentTerm = entry.Term
-		for _, req := range msg.Requests {
-			resp := &raft_cmdpb.Response{}
-			resp.CmdType = req.CmdType
-			switch req.CmdType {
-			case raft_cmdpb.CmdType_Get:
-				getResp := &raft_cmdpb.GetResponse{}
-				txn := d.peerStorage.Engines.Kv.NewTransaction(false)
-				key := req.Get.Key
-				// TODO(chapche) what if not found? How can we propegate the error?
-				if err := util.CheckKeyInRegion(key, d.Region()); err != nil {
-					getResp.Value = nil
-				} else {
-					val, err := engine_util.GetCFFromTxn(txn, req.Get.Cf, key)
-					if err == nil {
-						getResp.Value = val
-					}
-				}
-				txn.Discard()
-				resp.Get = getResp
-			case raft_cmdpb.CmdType_Put:
-				putResp := &raft_cmdpb.PutResponse{}
-				kvWB := new(engine_util.WriteBatch)
-				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-				resp.Put = putResp
-			case raft_cmdpb.CmdType_Delete:
-				deleteResp := &raft_cmdpb.DeleteResponse{}
-				kvWB := new(engine_util.WriteBatch)
-				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-				kvWB.MustWriteToDB(d.peerStorage.Engines.Kv)
-				resp.Delete = deleteResp
-			case raft_cmdpb.CmdType_Snap:
-				snapResp := &raft_cmdpb.SnapResponse{}
-				snapResp.Region = d.Region()
-				resp.Snap = snapResp
-			}
-			cmdResp.Responses = append(cmdResp.Responses, resp)
-		}
+
+		var cmdResp *raft_cmdpb.RaftCmdResponse
 		if nil != msg.AdminRequest {
-			adminResp := &raft_cmdpb.AdminResponse{}
-			// TODO(chapche)
-			cmdResp.AdminResponse = adminResp
+			cmdResp = d.processAdminRequest(msg)
+		} else {
+			cmdResp = d.processNormalRequest(msg)
 		}
 
 		// Find and remove matching proposal, also clean up stale proposals

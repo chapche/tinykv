@@ -168,6 +168,10 @@ func (rn *RawNode) Ready() Ready {
 		CommittedEntries: rn.Raft.RaftLog.nextEnts(),
 		Messages:         rn.Raft.msgs,
 	}
+	// Include pending snapshot if any
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		r.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	if rn.lastReady.Lead != rn.Raft.Lead || rn.lastReady.RaftState != rn.Raft.State {
 		r.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
 		rn.lastReady.SoftState = &SoftState{Lead: rn.Raft.Lead, RaftState: rn.Raft.State}
@@ -195,6 +199,10 @@ func (rn *RawNode) Ready() Ready {
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
+	// Check for pending snapshot
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		return true
+	}
 	if rn.lastReady.Lead != rn.Raft.Lead || rn.lastReady.RaftState != rn.Raft.State {
 		return true
 	}
@@ -220,7 +228,13 @@ func (rn *RawNode) HasReady() bool {
 // Advance notifies the RawNode that the application has applied and saved progress in the
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
-	// TODO(chapche) snapshot
+	// Handle snapshot first
+	if rd.Snapshot.Metadata != nil && rd.Snapshot.Metadata.Index > 0 {
+		rn.Raft.RaftLog.stabled = rd.Snapshot.Metadata.Index
+		rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
+		rn.Raft.RaftLog.pendingSnapshot = nil
+	}
+	// Handle entries
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
@@ -230,6 +244,8 @@ func (rn *RawNode) Advance(rd Ready) {
 		lastAppliedIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		rn.Raft.RaftLog.applied = lastAppliedIndex
 	}
+	// Compact log entries that are no longer needed
+	rn.Raft.RaftLog.maybeCompact()
 }
 
 // GetProgress return the Progress of this node and its peers, if this

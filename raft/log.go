@@ -15,8 +15,6 @@
 package raft
 
 import (
-	"errors"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -95,7 +93,32 @@ func newLog(storage Storage) *RaftLog {
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
-	// Your Code Here (2C).
+	// Get the first index from storage (entries before this have been compacted)
+	firstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		return
+	}
+	// Remove entries that have been compacted in storage
+	if len(l.entries) > 0 && l.entries[0].Index < firstIndex {
+		// Find the position where we should start keeping entries
+		for i := range l.entries {
+			if l.entries[i].Index >= firstIndex {
+				l.entries = l.entries[i:]
+				return
+			}
+		}
+		// All entries have been compacted
+		l.entries = nil
+	}
+}
+
+// matchTerm checks if a log entry at the given index has the given term
+func (l *RaftLog) matchTerm(index, term uint64) bool {
+	t, err := l.Term(index)
+	if err != nil {
+		return false
+	}
+	return t == term
 }
 
 // allEntries return all the entries not compacted.
@@ -136,26 +159,42 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	unstable := uint64(len(l.entries))
-	if unstable == 0 {
-		stable, err := l.storage.LastIndex()
-		if err != nil {
-			return 0
-		}
-		return stable
+	if unstable > 0 {
+		return l.entries[unstable-1].Index
 	}
-	return l.entries[unstable-1].Index
+	// Check pendingSnapshot first
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
+	stable, err := l.storage.LastIndex()
+	if err != nil {
+		return 0
+	}
+	return stable
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-	stableTerm, err := l.storage.Term(i)
-	if err == nil {
-		return stableTerm, nil
+	// Check pendingSnapshot first
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata != nil {
+		if i == l.pendingSnapshot.Metadata.Index {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		// If index is before snapshot, it's compacted
+		if i < l.pendingSnapshot.Metadata.Index {
+			return 0, ErrCompacted
+		}
 	}
+	// Check unstable entries
 	for _, entry := range l.entries {
 		if entry.Index == i {
 			return entry.Term, nil
 		}
 	}
-	return 0, errors.New("RaftLog: entry index out of bound")
+	// Check storage
+	stableTerm, err := l.storage.Term(i)
+	if err == nil {
+		return stableTerm, nil
+	}
+	return 0, err
 }

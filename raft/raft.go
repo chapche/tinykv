@@ -386,6 +386,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleMsgHup(m)
 		case pb.MessageType_MsgRequestVoteResponse:
 			return nil
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		default:
 			log.Debugf("unexpected message type in follower state")
 			return errors.New("unexpected message type")
@@ -402,6 +404,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleMsgHup(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleRequestVote(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		default:
 			log.Debugf("unexpected message type in candidate state")
 			return errors.New("unexpected message type")
@@ -425,6 +429,8 @@ func (r *Raft) Step(m pb.Message) error {
 		// node will become a leader when received more than half votes, we need to handle remaining vote
 		case pb.MessageType_MsgRequestVoteResponse:
 			r.handleRequestVoteResponse(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		default:
 			log.Debugf("unexpected message type in leader state")
 			return errors.New("unexpected message type")
@@ -613,31 +619,8 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) sendAppendEntries(to uint64, index uint64) {
 	logTerm, err := r.RaftLog.Term(index)
 	if err != nil {
-		// entry not found (possibly compacted), try sending from lastIndex as fallback
-		// Note: In a complete implementation, this should trigger a snapshot send
-		log.Warnf("sendAppendEntries entry not found! id:%v index:%v commit:%v to:%v err:%v", r.id, index, r.RaftLog.committed, to, err)
-		lastIndex := r.RaftLog.LastIndex()
-		if lastIndex == 0 {
-			// No entries at all, nothing to send
-			return
-		}
-		logTerm, err = r.RaftLog.Term(lastIndex)
-		if err != nil {
-			// Still can't get term, give up
-			log.Warnf("sendAppendEntries cannot get term for lastIndex! id:%v lastIndex:%v", r.id, lastIndex)
-			return
-		}
-		msg := &pb.Message{
-			MsgType: pb.MessageType_MsgAppend,
-			From:    r.id,
-			To:      to,
-			Term:    r.Term,
-			Entries: nil,
-			Index:   lastIndex,
-			LogTerm: logTerm,
-			Commit:  r.RaftLog.committed,
-		}
-		r.msgs = append(r.msgs, *msg)
+		// Entry not found (possibly compacted), need to send snapshot
+		r.sendSnapshot(to)
 		return
 	}
 
@@ -678,6 +661,25 @@ func (r *Raft) sendAppendEntries(to uint64, index uint64) {
 		Commit:  r.RaftLog.committed,
 	}
 	r.msgs = append(r.msgs, *msg)
+}
+
+func (r *Raft) sendSnapshot(to uint64) {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		// Snapshot is not ready yet, will retry later
+		log.Warnf("sendSnapshot id:%v to:%v failed to get snapshot: %v", r.id, to, err)
+		return
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		From:     r.id,
+		To:       to,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	}
+	r.msgs = append(r.msgs, msg)
+	// Update progress to reflect the snapshot
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
 }
 
 func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
@@ -918,7 +920,61 @@ func (r *Raft) resetRandomizedElectionTimeout() {
 
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
-	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+	if meta == nil {
+		return
+	}
+	snapIndex := meta.Index
+	snapTerm := meta.Term
+
+	// If the snapshot is stale (our committed index is higher), ignore it
+	if snapIndex <= r.RaftLog.committed {
+		return
+	}
+
+	// Check if we already have this snapshot's entries
+	if r.RaftLog.matchTerm(snapIndex, snapTerm) {
+		// We already have this snapshot's data, just update commit index
+		r.RaftLog.committed = snapIndex
+		return
+	}
+
+	// Accept the snapshot
+	// Update term and become follower if needed
+	if m.Term > r.Term {
+		r.Term = m.Term
+	}
+	if r.State != StateFollower {
+		r.becomeFollower(m.Term, m.From)
+	}
+	r.Lead = m.From
+
+	// Clear all entries and set pendingSnapshot
+	r.RaftLog.entries = nil
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	// Update log state
+	r.RaftLog.committed = snapIndex
+	r.RaftLog.applied = snapIndex
+	r.RaftLog.stabled = snapIndex
+
+	// Restore peers from snapshot's ConfState
+	if meta.ConfState != nil {
+		r.Prs = make(map[uint64]*Progress)
+		r.peers = meta.ConfState.Nodes
+		for _, peer := range meta.ConfState.Nodes {
+			r.Prs[peer] = &Progress{}
+		}
+	}
+
+	// Send response to leader
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      m.From,
+		Term:    r.Term,
+		Index:   r.RaftLog.LastIndex(),
+	})
 }
 
 // addNode add a new node to raft group
