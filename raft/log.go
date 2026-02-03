@@ -87,7 +87,6 @@ func newLog(storage Storage) *RaftLog {
 				}
 			}
 		}
-
 	}
 	return log
 }

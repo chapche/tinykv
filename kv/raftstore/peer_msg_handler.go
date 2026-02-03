@@ -11,7 +11,6 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
-	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -179,17 +178,9 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	entries := make([]*eraftpb.Entry, 0, len(msg.Requests))
-	lastIndex := d.peerStorage.raftState.LastIndex
-	lastIndex++
 	b, _ := msg.Marshal()
-	entry := eraftpb.Entry{
-		EntryType: eraftpb.EntryType_EntryNormal,
-		Index:     lastIndex,
-		Term:      d.Term(),
-		Data:      b,
-	}
-	entries = append(entries, &entry)
+	// Use RaftGroup's LastIndex to get the accurate next index (including unstable entries)
+	lastIndex := d.RaftGroup.Raft.RaftLog.LastIndex() + 1
 	pro := &proposal{
 		index: lastIndex,
 		term:  d.Term(),
@@ -197,13 +188,14 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 	log.Infof("Tag:%v Leader:%v append proposal index-term %v-%v", d.Tag, d.LeaderId(), lastIndex, d.Term())
 	d.proposals = append(d.proposals, pro)
-	raftMsg := eraftpb.Message{
-		MsgType: eraftpb.MessageType_MsgPropose,
-		From:    d.LeaderId(),
-		To:      d.LeaderId(),
-		Entries: entries,
+	// Let Raft layer handle the entry index and term assignment
+	err = d.RaftGroup.Propose(b)
+	if err != nil {
+		log.Warnf("Tag:%v propose failed: %v", d.Tag, err)
+		cb.Done(ErrResp(err))
+		// Remove the proposal we just added
+		d.proposals = d.proposals[:len(d.proposals)-1]
 	}
-	d.RaftGroup.Step(raftMsg)
 }
 
 func (d *peerMsgHandler) onTick() {

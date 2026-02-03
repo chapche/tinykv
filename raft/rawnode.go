@@ -224,15 +224,12 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.Entries) > 0 {
 		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
 	}
-	if rn.Raft.RaftLog.committed < rd.Commit {
-		rn.Raft.RaftLog.committed = rd.Commit	
-	}
+	// Note: committed is managed by Raft layer, not updated in Advance.
+	// The application only updates stabled and applied.
 	if len(rd.CommittedEntries) > 0 {
 		lastAppliedIndex := rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
-		rn.Raft.RaftLog.applied = lastAppliedIndex 
+		rn.Raft.RaftLog.applied = lastAppliedIndex
 	}
-	// Clear messages that have been sent
-	rn.Raft.msgs = nil
 }
 
 // GetProgress return the Progress of this node and its peers, if this

@@ -247,14 +247,9 @@ func (r *Raft) sendHeartbeat(to uint64) {
 }
 
 func (r *Raft) sendRequestVote(to uint64) {
-	var logTerm uint64
-	var index uint64
-	logTerm, index = 0, 0
-	if len(r.RaftLog.entries) > 0 {
-		entry := &r.RaftLog.entries[len(r.RaftLog.entries)-1]
-		index = entry.Index
-		logTerm = entry.Term
-	}
+	// Use RaftLog methods to get last index and term (including stabled entries)
+	index := r.RaftLog.LastIndex()
+	logTerm, _ := r.RaftLog.Term(index)
 	m := &pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
 		From:    r.id,
@@ -356,18 +351,18 @@ func (r *Raft) becomeLeader() {
 	if len(r.peers) <= 1 { // commit directly if single node
 		r.RaftLog.committed = noOpEntry.Index
 	}
-	// append noop entry to log
+	// Initialize progress for all peers
 	for _, id := range r.peers {
 		if id == r.id {
 			r.Prs[id] = &Progress{
-				Match: lastIndex + 1,
+				Match: lastIndex + 1, // leader has the noop entry
 				Next:  lastIndex + 2,
 			}
 		} else {
 			r.Prs[id] = &Progress{
-				Match: 0, // last matched index
-				// replicate the entries from last to match since we need to keep the entry sequence
-				Next: lastIndex,
+				Match: 0,
+				// Next should be lastIndex + 1 (noop entry index) to send noop entry to followers
+				Next: lastIndex + 1,
 			}
 			r.sendAppend(id)
 		}
@@ -519,30 +514,21 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			Term:    r.Term,
 			Index:   r.RaftLog.LastIndex(),
 			Reject:  true,
-			Commit: r.RaftLog.committed,
+			Commit:  r.RaftLog.committed,
 		})
-		return	
+		return
 	} else {
-		// reset timer first
-		r.becomeFollower(m.Term, m.From)
-		if m.Commit < r.RaftLog.committed {
-			// in case there are stale msgs
-			log.Warnf("id from:%v to:%v stale committed index from:%v cur:%v", m.From, r.id, m.Commit, r.RaftLog.committed)
-			r.msgs = append(r.msgs, pb.Message{
-				MsgType: pb.MessageType_MsgAppendResponse,
-				From:    r.id,
-				To:      m.From,
-				Term:    r.Term,
-				Index:   r.RaftLog.LastIndex(),
-				Reject:  true,
-				Commit: r.RaftLog.committed,
-			})
-			return
+		// reset state
+		if m.Term > r.Term {
+			r.Term = m.Term
+		}
+		if r.State != StateFollower || r.Lead != m.From {
+			r.becomeFollower(m.Term, m.From)
 		}
 		// check term and index
 		term, err := r.RaftLog.Term(m.Index)
 		if err != nil || term != m.LogTerm {
-			log.Warnf("log entry not match, index:%v current term: %v-%d, received term: %v-%d", m.Index, r.id, term, m.From, m.LogTerm)
+			log.Warnf("log entry not match, index:%v current id-term: %v-%d, received id-term: %v-%d", m.Index, r.id, term, m.From, m.LogTerm)
 			index := m.Index
 			if index > 0 {
 				index--
@@ -554,7 +540,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 				Term:    r.Term,
 				Index:   index,
 				Reject:  true,
-				Commit: r.RaftLog.committed,
+				Commit:  r.RaftLog.committed,
 			})
 			return
 		}
@@ -598,13 +584,20 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			}
 		}
 	}
-	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry from message)!
-	var commitIndex uint64
-	commitIndex = r.RaftLog.LastIndex()
-	if m.Commit < commitIndex {
-		commitIndex = m.Commit
+	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	// "last new entry" means the last entry from this message, not the local log's last entry
+	// because local log might be divergent from the leader's log
+	// - If message has entries: use the last entry's index
+	// - If message has no entries: use m.Index (prevLogIndex, the matched position)
+	if m.Commit > r.RaftLog.committed {
+		var lastNewEntry uint64
+		if len(m.Entries) > 0 {
+			lastNewEntry = m.Entries[len(m.Entries)-1].Index
+		} else {
+			lastNewEntry = m.Index
+		}
+		r.RaftLog.committed = min(m.Commit, lastNewEntry)
 	}
-	r.RaftLog.committed = commitIndex
 	// send a response back
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgAppendResponse,
@@ -612,51 +605,68 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		To:      m.From,
 		Term:    r.Term,
 		Index:   r.RaftLog.LastIndex(),
-		Commit: r.RaftLog.committed,
-		Reject: false,
+		Commit:  r.RaftLog.committed,
+		Reject:  false,
 	})
 }
 
 func (r *Raft) sendAppendEntries(to uint64, index uint64) {
 	logTerm, err := r.RaftLog.Term(index)
-	if err != nil {  // entry not found, negotiate from lastIndex
-		log.Warnf("sendAppendEntries entry not found! id:%v index:%v commit:%v logTerm:%v to:%v", to, index, r.RaftLog.committed, logTerm, to)
+	if err != nil {
+		// entry not found (possibly compacted), try sending from lastIndex as fallback
+		// Note: In a complete implementation, this should trigger a snapshot send
+		log.Warnf("sendAppendEntries entry not found! id:%v index:%v commit:%v to:%v err:%v", r.id, index, r.RaftLog.committed, to, err)
 		lastIndex := r.RaftLog.LastIndex()
-		logTerm, _ = r.RaftLog.Term(lastIndex)
+		if lastIndex == 0 {
+			// No entries at all, nothing to send
+			return
+		}
+		logTerm, err = r.RaftLog.Term(lastIndex)
+		if err != nil {
+			// Still can't get term, give up
+			log.Warnf("sendAppendEntries cannot get term for lastIndex! id:%v lastIndex:%v", r.id, lastIndex)
+			return
+		}
 		msg := &pb.Message{
 			MsgType: pb.MessageType_MsgAppend,
 			From:    r.id,
 			To:      to,
 			Term:    r.Term,
 			Entries: nil,
-			Index:   r.RaftLog.LastIndex(),
+			Index:   lastIndex,
 			LogTerm: logTerm,
 			Commit:  r.RaftLog.committed,
 		}
 		r.msgs = append(r.msgs, *msg)
 		return
 	}
-	idx := 0
-	entries := make([]*pb.Entry, 0, len(r.RaftLog.entries))
-	if index < r.RaftLog.stabled {
-		stabled_entries, _ := r.RaftLog.storage.Entries(index, r.RaftLog.stabled)
-		for _, entry := range stabled_entries {
-			entries = append(entries, &entry)
-		}
-	} else if index > 0 {
-		for i, entry := range r.RaftLog.entries {
-			if entry.Index == index {
-				logTerm = entry.Term
-				idx = i + 1
-				break
-			} else if entry.Index > index {
-				break
-			}
+
+	// index is prevLogIndex, we need to send entries starting from index+1
+	// r.RaftLog.entries contains all entries (both stabled and unstable),
+	// so we only need to get entries from there
+	entries := make([]*pb.Entry, 0)
+
+	// Find starting position in entries array
+	startIdx := -1
+	for i, entry := range r.RaftLog.entries {
+		if entry.Index == index+1 {
+			startIdx = i
+			break
+		} else if entry.Index > index+1 {
+			// The entries we need might have been compacted
+			// Start from this entry instead
+			startIdx = i
+			break
 		}
 	}
-	for ; idx < len(r.RaftLog.entries); idx++ {
-		entries = append(entries, &r.RaftLog.entries[idx])
+
+	// Append entries from startIdx to end
+	if startIdx >= 0 {
+		for i := startIdx; i < len(r.RaftLog.entries); i++ {
+			entries = append(entries, &r.RaftLog.entries[i])
+		}
 	}
+
 	msg := &pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
 		From:    r.id,
@@ -842,14 +852,14 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 				r.sendAppendEntries(id, pr.Match)
 			}
 			return
-		} else if (m.Commit < r.RaftLog.committed) {
+		} else if m.Commit < r.RaftLog.committed {
 			// update commitIndex
 			log.Infof("handleHeartbeatResponse id:%v update committedIndex from %v to %v", r.id, m.Commit, r.RaftLog.committed)
 			r.sendAppendEntries(m.From, m.Index)
 			return
 		}
 	} else { // only send entries if not match
-		log.Warnf("handleHeartbeatResponse index:%v log entry missmatch id:%v-%v from:%v-%v", m.Index, r.id, term, m.From, m.LogTerm)	
+		log.Warnf("handleHeartbeatResponse index:%v log entry missmatch id:%v-%v from:%v-%v", m.Index, r.id, term, m.From, m.LogTerm)
 		r.sendAppendEntries(m.From, m.Index)
 	}
 }
@@ -870,6 +880,8 @@ func (r *Raft) handleBeat(m pb.Message) {
 func (r *Raft) handlePropose(m pb.Message) {
 	index := r.RaftLog.LastIndex()
 	oldIndex := index
+	// Get the term of the previous entry for log matching
+	oldLogTerm, _ := r.RaftLog.Term(oldIndex)
 	for _, entry := range m.Entries {
 		index++
 		entry.Index = index
@@ -894,8 +906,8 @@ func (r *Raft) handlePropose(m pb.Message) {
 			To:      id,
 			Term:    r.Term,
 			Entries: m.Entries,
-			Index:   oldIndex, // index
-			LogTerm: r.Term,
+			Index:   oldIndex,
+			LogTerm: oldLogTerm, // Use the correct term of the previous entry
 			Commit:  r.RaftLog.committed,
 		}
 		r.msgs = append(r.msgs, *msg)

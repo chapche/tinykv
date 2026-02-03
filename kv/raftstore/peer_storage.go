@@ -307,8 +307,11 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	var newLastIndex uint64 = 0
-	var newLastTerm uint64 = 0
+	if len(entries) == 0 {
+		return nil
+	}
+	var newLastIndex uint64 = ps.raftState.LastIndex
+	var newLastTerm uint64 = ps.raftState.LastTerm
 	for _, entry := range entries {
 		if entry.Index > newLastIndex {
 			newLastIndex = entry.Index
@@ -316,7 +319,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		}
 		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
 	}
-	// delete redundent entries
+	// delete redundant entries that will never be committed (due to log truncation)
 	if newLastIndex < ps.raftState.LastIndex {
 		for i := newLastIndex + 1; i <= ps.raftState.LastIndex; i++ {
 			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
@@ -349,14 +352,20 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// stable logs
 	raftWB := new(engine_util.WriteBatch)
-	if len(ready.Entries) > 0 {
+	hasEntries := len(ready.Entries) > 0
+	if hasEntries {
 		err := ps.Append(ready.Entries, raftWB)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if ready.HardState.Term > 0 {
+	// Check if HardState has changed (not empty)
+	hasHardStateChanged := !raft.IsEmptyHardState(ready.HardState)
+	if hasHardStateChanged {
 		ps.raftState.HardState = &ready.HardState
+	}
+	// Always save raftState if we have entries or hardstate changes
+	if hasEntries || hasHardStateChanged {
 		raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	}
 	kvWB := new(engine_util.WriteBatch)
@@ -366,7 +375,6 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 	// write to raftDb at once which CANNOT fail!
 	raftWB.MustWriteToDB(ps.Engines.Raft)
-	// TODO(chapche) write applyState!
 	kvWB.MustWriteToDB(ps.Engines.Kv)
 	return res, nil
 }
